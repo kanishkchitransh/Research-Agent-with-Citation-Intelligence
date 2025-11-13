@@ -1,0 +1,51 @@
+# Core LLM and Agent Framework
+google-generativeai>=0.3.0
+langchain>=0.1.0
+langchain-google-genai>=0.0.6
+
+# RAG Components
+chromadb>=0.4.22
+sentence-transformers>=2.3.1
+faiss-cpu>=1.7.4
+
+# PDF Processing
+PyMuPDF>=1.23.0
+pymupdf4llm>=0.0.5
+pypdf>=3.17.0
+
+# Citation and Reference Handling
+arxiv>=2.1.0
+scholarly>=1.7.11
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Text Processing
+tiktoken>=0.5.2
+nltk>=3.8.1
+spacy>=3.7.0
+
+# Data Handling
+pandas>=2.1.0
+numpy>=1.24.0
+pydantic>=2.5.0
+
+# Web Interface
+gradio>=4.16.0
+streamlit>=1.29.0
+
+# Development and Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.12.0
+flake8>=7.0.0
+isort>=5.13.0
+
+# Logging and Monitoring
+loguru>=0.7.2
+python-dotenv>=1.0.0
+tqdm>=4.66.0
+
+# Utilities
+python-dateutil>=2.8.0
+pyyaml>=6.0.1
+tenacity>=8.2.0
