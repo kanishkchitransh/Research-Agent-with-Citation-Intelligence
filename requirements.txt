@@ -18,6 +18,9 @@ arxiv>=2.1.0
 scholarly>=1.7.11
 requests>=2.31.0
 beautifulsoup4>=4.12.0
+google-api-python-client>=2.100.0  # Google Custom Search API
+lxml>=4.9.0  # Better HTML parsing
+trafilatura>=1.6.0  # Web content extraction
 
 # Text Processing
 tiktoken>=0.5.2

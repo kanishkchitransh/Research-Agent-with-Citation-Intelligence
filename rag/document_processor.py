@@ -298,7 +298,12 @@ class DocumentProcessor:
             chunks.append(text[start:end].strip())
 
             # Move start position with overlap
-            start = end - self.chunk_overlap
+            new_start = end - self.chunk_overlap
+            # Ensure we always make progress to avoid infinite loops
+            if new_start <= start:
+                start = end  # Move to the end without overlap
+            else:
+                start = new_start
 
         return chunks
 

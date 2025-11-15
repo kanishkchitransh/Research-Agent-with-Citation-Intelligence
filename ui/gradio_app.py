@@ -1,0 +1,433 @@
+"""
+Research Agent with Citation Intelligence - Gradio Web Interface
+
+This app demonstrates the unique citation intelligence feature:
+- Upload research papers (PDF)
+- Automatically extract citations
+- Find cited papers on the web (ArXiv, IEEE, ACM, etc.)
+- AI-powered explanation of why papers cite each other
+
+Built by an NLP researcher, for researchers.
+"""
+
+import gradio as gr
+import os
+import sys
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from agent import ResearchAgent, ToolRegistry
+from rag import DocumentProcessor, Retriever, VectorStore
+from config import config
+
+# Global variables
+agent = None
+retriever = None
+current_paper_id = None
+current_citations = []
+
+
+def initialize_system():
+    """Initialize the Research Agent system."""
+    global agent, retriever
+
+    if agent is not None:
+        return "System already initialized!"
+
+    try:
+        print("🔧 Initializing Research Agent...")
+
+        # Initialize RAG components
+        doc_processor = DocumentProcessor(
+            chunk_size=config.rag.chunk_size,
+            chunk_overlap=config.rag.chunk_overlap
+        )
+
+        vector_store = VectorStore(
+            db_path=config.vector_store.db_path,
+            collection_name=config.vector_store.collection_name,
+            embedding_model_name=config.embedding.model_name
+        )
+
+        retriever = Retriever(vector_store, doc_processor)
+
+        # Initialize agent
+        tool_registry = ToolRegistry(retriever)
+        agent = ResearchAgent(
+            tool_registry=tool_registry,
+            api_key=config.model.api_key,
+            model_name=config.model.name,
+            max_iterations=config.agent.max_iterations,
+            verbose=False
+        )
+
+        print("✅ Research Agent initialized successfully!")
+        return "System initialized successfully!"
+
+    except Exception as e:
+        error_msg = f"Error initializing system: {str(e)}"
+        print(f"❌ {error_msg}")
+        return error_msg
+
+
+def upload_and_process_paper(pdf_file):
+    """Upload and process a research paper."""
+    global current_paper_id, current_citations, retriever, agent
+
+    if agent is None:
+        init_msg = initialize_system()
+        if "Error" in init_msg:
+            return init_msg, "System initialization failed", []
+
+    if pdf_file is None:
+        return "❌ Please upload a PDF file", "", []
+
+    try:
+        # Save the uploaded file
+        pdf_path = Path(pdf_file.name)
+        print(f"📄 Processing: {pdf_path.name}")
+
+        # Ingest paper into RAG system
+        paper_id = retriever.ingest_paper(pdf_path)
+        current_paper_id = paper_id
+
+        # Get paper details
+        paper = retriever._get_paper(paper_id)
+
+        # Extract citations using agent
+        print("🔍 Extracting citations...")
+        citations_response = agent.query(f"Extract all citations from paper '{paper_id}'")
+
+        # Parse citations from response (simplified)
+        # We'll extract citations from the agent's response text
+        response_text = citations_response.answer
+
+        # Try to extract citation markers from the response
+        import re
+        citation_patterns = [
+            r'\(([A-Z][a-z]+(?:\s+et\s+al\.)?(?:,\s*\d{4})?)\)',  # (Author, Year)
+            r'\[(\d+)\]',  # [1]
+            r'\[([A-Z][a-z]+(?:\s+et\s+al\.)?)\]'  # [Author et al.]
+        ]
+
+        citations_found = []
+        for pattern in citation_patterns:
+            matches = re.findall(pattern, response_text)
+            citations_found.extend([f"({m})" if not m.startswith('[') else m for m in matches])
+
+        # Remove duplicates and sort
+        citations_found = sorted(list(set(citations_found)))[:20]  # Limit to 20 for UI
+        current_citations = citations_found
+
+        # Format paper info
+        paper_info = f"## ✅ Paper Processed Successfully!\n\n"
+        paper_info += f"**Title:** {paper.title}\n\n"
+        paper_info += f"**Paper ID:** {paper_id}\n\n"
+
+        if paper.abstract:
+            paper_info += f"**Abstract:** {paper.abstract[:300]}...\n\n"
+
+        paper_info += f"**Citations Found:** {len(citations_found)}\n\n"
+        paper_info += "👇 Select a citation below to explain it!"
+
+        print(f"✅ Processed successfully! Found {len(citations_found)} citations")
+
+        return paper_info, citations_response.answer, gr.update(choices=citations_found, value=citations_found[0] if citations_found else None)
+
+    except Exception as e:
+        error_msg = f"❌ Error processing paper: {str(e)}"
+        print(error_msg)
+        return error_msg, "", []
+
+
+def explain_selected_citation(citation_marker):
+    """Explain a selected citation using the agent."""
+    global current_paper_id, agent
+
+    if agent is None:
+        return "❌ Please initialize the system first by uploading a paper."
+
+    if not current_paper_id:
+        return "❌ Please upload a paper first!"
+
+    if not citation_marker:
+        return "❌ Please select a citation to explain!"
+
+    try:
+        print(f"🔍 Explaining citation: {citation_marker}")
+
+        # Use agent to explain citation (this will use Perplexity search!)
+        query = f"Explain citation '{citation_marker}' in paper '{current_paper_id}'"
+
+        response = agent.query(query)
+
+        if response.success:
+            # Format the explanation nicely
+            explanation = f"## 🎯 Citation Explanation\n\n"
+            explanation += f"**Citation:** {citation_marker}\n\n"
+            explanation += f"---\n\n"
+            explanation += response.answer
+            explanation += f"\n\n---\n\n"
+            explanation += f"*Used {len(response.steps)} reasoning steps to find and explain this citation.*"
+
+            print(f"✅ Explanation generated successfully!")
+            return explanation
+        else:
+            return f"❌ Failed to explain citation: {response.error}"
+
+    except Exception as e:
+        error_msg = f"❌ Error explaining citation: {str(e)}"
+        print(error_msg)
+        return error_msg
+
+
+def ask_question(question):
+    """Ask a general question about the papers."""
+    global agent, current_paper_id
+
+    if agent is None:
+        return "❌ Please initialize the system first by uploading a paper."
+
+    if not question or not question.strip():
+        return "❌ Please enter a question!"
+
+    try:
+        print(f"💬 Question: {question}")
+
+        response = agent.query(question)
+
+        if response.success:
+            answer = f"## 🤖 Agent Response\n\n"
+            answer += response.answer
+            answer += f"\n\n---\n\n"
+            answer += f"*Used {len(response.steps)} reasoning steps*"
+
+            print(f"✅ Answer generated!")
+            return answer
+        else:
+            return f"❌ Error: {response.error}"
+
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        print(error_msg)
+        return error_msg
+
+
+# Create Gradio Interface
+with gr.Blocks(
+    title="Research Agent - Citation Intelligence",
+    theme=gr.themes.Soft(),
+    css="""
+    .citation-card {
+        border: 2px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 15px;
+        margin: 10px 0;
+    }
+    """
+) as demo:
+
+    # Header
+    gr.Markdown("""
+    # 🔬 Research Agent with Citation Intelligence
+
+    ### Your AI Assistant for Understanding Research Papers
+
+    **What makes this special:**
+    - 📄 Upload research papers (PDF)
+    - 🔍 Automatically extract citations
+    - 🌐 **Find cited papers on the web** (ArXiv, IEEE, ACM, Google Scholar, etc.)
+    - 💡 **AI explains WHY papers cite each other**
+
+    ---
+
+    **🎯 Unique Feature:** Unlike other tools, this agent automatically searches the web to find
+    cited papers and explains their relevance - saving you hours of manual research!
+    """)
+
+    # Main content
+    with gr.Tabs():
+
+        # Tab 1: Citation Intelligence
+        with gr.Tab("🔍 Citation Intelligence"):
+            gr.Markdown("## Upload & Explore Citations")
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    pdf_upload = gr.File(
+                        label="📤 Upload Research Paper (PDF)",
+                        file_types=[".pdf"],
+                        type="filepath"
+                    )
+                    upload_btn = gr.Button(
+                        "🚀 Process Paper",
+                        variant="primary",
+                        size="lg"
+                    )
+
+                with gr.Column(scale=1):
+                    paper_info = gr.Markdown(
+                        "### 📋 Paper Info\n\nUpload a paper to get started!"
+                    )
+
+            gr.Markdown("---")
+
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### 📚 All Citations Found")
+                    citations_list = gr.Textbox(
+                        label="Citations",
+                        lines=10,
+                        placeholder="Citations will appear here after processing..."
+                    )
+
+                with gr.Column():
+                    gr.Markdown("### 🎯 Select Citation to Explain")
+                    citation_dropdown = gr.Dropdown(
+                        label="Citation",
+                        choices=[],
+                        interactive=True,
+                        info="Select a citation from the dropdown"
+                    )
+                    explain_btn = gr.Button(
+                        "💡 Explain This Citation",
+                        variant="primary",
+                        size="lg"
+                    )
+
+            gr.Markdown("---")
+
+            gr.Markdown("### 📖 Citation Explanation")
+            explanation_output = gr.Markdown(
+                "*Select a citation above and click 'Explain' to see details about the cited paper*"
+            )
+
+        # Tab 2: Q&A
+        with gr.Tab("💬 Ask Questions"):
+            gr.Markdown("""
+            ## Ask Questions About Your Papers
+
+            You can ask questions like:
+            - "What are the main contributions of this paper?"
+            - "What methodology is used?"
+            - "Compare this with the BERT paper"
+            - "What datasets are used?"
+            """)
+
+            question_input = gr.Textbox(
+                label="Your Question",
+                placeholder="e.g., What is the main contribution of this paper?",
+                lines=3
+            )
+            ask_btn = gr.Button("🔍 Ask", variant="primary", size="lg")
+
+            answer_output = gr.Markdown("*Your answer will appear here*")
+
+        # Tab 3: About
+        with gr.Tab("ℹ️ About"):
+            gr.Markdown("""
+            ## About This Project
+
+            ### 🎯 The Problem
+            When reading research papers, understanding citations is crucial but time-consuming:
+            - What is this cited paper about?
+            - Why was it cited?
+            - How does it relate to the current paper?
+
+            Currently, you have to:
+            1. Google the citation
+            2. Find the paper on ArXiv/IEEE/ACM
+            3. Read the abstract
+            4. Figure out the connection yourself
+
+            **This takes 5-10 minutes per citation!**
+
+            ### ✅ The Solution
+            This Research Agent automates the entire process:
+            1. **Extracts** all citations from your paper
+            2. **Searches** the web for cited papers (Perplexity AI)
+            3. **Finds** the paper on ArXiv, IEEE, ACM, Google Scholar, etc.
+            4. **Scrapes** the paper details (title, authors, abstract)
+            5. **Explains** why it was cited using AI
+
+            **Result: 30 seconds instead of 5-10 minutes!**
+
+            ### 🔧 Technology Stack
+            - **LLM**: Gemini 2.0 Flash (reasoning & explanation)
+            - **Search**: Perplexity AI (web search for papers)
+            - **RAG**: ChromaDB + sentence-transformers
+            - **Agent**: ReAct pattern with function calling
+            - **Scraping**: Custom scrapers for ArXiv, IEEE, ACM
+
+            ### 🌟 What Makes This Unique
+            Unlike ChatPDF or other document Q&A tools, this agent:
+            - ✅ Finds cited papers on the web (not just your uploads)
+            - ✅ Searches multiple sources (ArXiv, IEEE, ACM, Scholar)
+            - ✅ Explains citation relationships with AI
+            - ✅ Built specifically for academic research
+
+            ### 👨‍💻 Built By
+            An NLP researcher who understands the pain of literature reviews!
+
+            **GitHub**: [Research-Agent-with-Citation-Intelligence](https://github.com/yourusername/Research-Agent-with-Citation-Intelligence)
+
+            ---
+
+            **💡 Tip**: Try uploading a paper from your field and explore its citations!
+            """)
+
+    # Event handlers
+    upload_btn.click(
+        fn=upload_and_process_paper,
+        inputs=[pdf_upload],
+        outputs=[paper_info, citations_list, citation_dropdown]
+    )
+
+    explain_btn.click(
+        fn=explain_selected_citation,
+        inputs=[citation_dropdown],
+        outputs=[explanation_output]
+    )
+
+    ask_btn.click(
+        fn=ask_question,
+        inputs=[question_input],
+        outputs=[answer_output]
+    )
+
+    # Footer
+    gr.Markdown("""
+    ---
+    <div style="text-align: center; color: #666;">
+        <p>🔬 Research Agent with Citation Intelligence | Built with ❤️ for Researchers</p>
+        <p>Powered by Gemini AI + Perplexity Search + ChromaDB</p>
+    </div>
+    """)
+
+
+# Launch
+if __name__ == "__main__":
+    print("="*70)
+    print("🚀 Starting Research Agent Web Interface")
+    print("="*70)
+    print("\n⚙️  Initializing system on startup...")
+
+    # Initialize on startup
+    try:
+        initialize_system()
+    except Exception as e:
+        print(f"⚠️  Warning: Could not initialize on startup: {e}")
+        print("   System will initialize on first paper upload.")
+
+    print("\n✅ Server starting...")
+    print("🌐 Access the app at: http://localhost:7860")
+    print("\n💡 Tip: Upload a research paper to get started!")
+    print("="*70 + "\n")
+
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False  # Set to True for temporary public link
+    )

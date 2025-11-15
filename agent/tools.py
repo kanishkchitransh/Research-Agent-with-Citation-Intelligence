@@ -7,6 +7,7 @@ import arxiv
 import requests
 from loguru import logger
 
+from citation import CitationExplainer, CitationExtractor, CitationResolver
 from rag.retriever import Retriever
 
 
@@ -50,15 +51,40 @@ class Tool:
 class ToolRegistry:
     """Registry of tools available to the agent."""
 
-    def __init__(self, retriever: Retriever):
+    def __init__(
+        self,
+        retriever: Retriever,
+        api_key: Optional[str] = None,
+        perplexity_api_key: Optional[str] = None
+    ):
         """
         Initialize the tool registry.
 
         Args:
             retriever: Retriever instance for RAG operations
+            api_key: Optional Google API key for citation intelligence and LLM
+            perplexity_api_key: Optional Perplexity API key for citation search
         """
         self.retriever = retriever
         self.tools: Dict[str, Tool] = {}
+
+        # Initialize citation intelligence components
+        self.citation_extractor = CitationExtractor(context_window=200)
+        self.citation_resolver = CitationResolver(
+            max_results=3,
+            google_api_key=api_key,
+            perplexity_api_key=perplexity_api_key
+        )
+        self.citation_explainer = None
+
+        # Initialize explainer if API key provided
+        if api_key:
+            try:
+                self.citation_explainer = CitationExplainer(api_key=api_key)
+                logger.info("Citation intelligence initialized with explainer and search APIs")
+            except Exception as e:
+                logger.warning(f"Could not initialize CitationExplainer: {e}")
+
         self._register_tools()
 
     def _register_tools(self):
@@ -213,6 +239,43 @@ class ToolRegistry:
                 "required": ["paper_id"],
             },
             function=self._get_paper_abstract,
+        )
+
+        # Citation Intelligence tools
+        self._register_tool(
+            name="extract_citations",
+            description="Extract all citations from a paper and get statistics. Shows citation markers, types, and frequency.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "paper_id": {
+                        "type": "string",
+                        "description": "The ID of the paper to extract citations from",
+                    },
+                },
+                "required": ["paper_id"],
+            },
+            function=self._extract_citations,
+        )
+
+        self._register_tool(
+            name="explain_citation",
+            description="Explain why a citation is relevant and what relationship exists between the citing and cited papers. Requires the citation marker and context.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "paper_id": {
+                        "type": "string",
+                        "description": "The ID of the paper containing the citation",
+                    },
+                    "citation_marker": {
+                        "type": "string",
+                        "description": "The citation marker (e.g., '[1]', '[Smith et al.]')",
+                    },
+                },
+                "required": ["paper_id", "citation_marker"],
+            },
+            function=self._explain_citation,
         )
 
     def _register_tool(
@@ -388,3 +451,108 @@ class ToolRegistry:
         except Exception as e:
             logger.error(f"Error in get_paper_abstract: {e}")
             return f"Error retrieving abstract: {str(e)}"
+
+    def _extract_citations(self, paper_id: str) -> str:
+        """Extract citations from a paper."""
+        try:
+            # Get paper from retriever
+            paper = self.retriever._get_paper(paper_id)
+
+            if not paper:
+                return f"Paper '{paper_id}' not found."
+
+            # Extract citations from full text
+            extracted = self.citation_extractor.extract(paper.full_text)
+
+            if extracted.total_count == 0:
+                return f"No citations found in paper '{paper_id}'."
+
+            # Get statistics
+            stats = self.citation_extractor.get_citation_stats(paper.full_text)
+
+            # Format output
+            output = f"Citations in paper '{paper_id}':\n\n"
+            output += f"Total citations: {stats['total_citations']}\n"
+            output += f"Unique citations: {stats['unique_citations']}\n"
+            output += f"Citation types:\n"
+            output += f"  - Numeric (brackets): {stats['numeric']}\n"
+            output += f"  - Named: {stats['named']}\n"
+            output += f"  - Author-year: {stats['author_year']}\n"
+            output += f"  - Footnote/Endnote: {stats['footnote']}\n\n"
+
+            # Show first 10 unique citations
+            output += f"Sample citations:\n"
+            for i, marker in enumerate(extracted.unique_markers[:10], 1):
+                output += f"  {i}. {marker}\n"
+
+            if len(extracted.unique_markers) > 10:
+                output += f"  ... and {len(extracted.unique_markers) - 10} more\n"
+
+            return output
+
+        except Exception as e:
+            logger.error(f"Error in extract_citations: {e}")
+            return f"Error extracting citations: {str(e)}"
+
+    def _explain_citation(self, paper_id: str, citation_marker: str) -> str:
+        """Explain why a citation is relevant."""
+        try:
+            # Get paper
+            paper = self.retriever._get_paper(paper_id)
+            if not paper:
+                return f"Paper '{paper_id}' not found."
+
+            # Get citation context
+            context = self.citation_extractor.extract_citation_context(
+                paper.full_text, citation_marker
+            )
+
+            if not context:
+                return f"Citation '{citation_marker}' not found in paper '{paper_id}'."
+
+            # Try to resolve the citation
+            resolved = self.citation_resolver.resolve(citation_marker, context)
+
+            if not resolved:
+                return (
+                    f"Context around citation '{citation_marker}':\n\n{context}\n\n"
+                    f"Note: Could not resolve this citation to an ArXiv paper. "
+                    f"The citation may reference a non-ArXiv source or use an "
+                    f"unrecognized format."
+                )
+
+            # Generate explanation if explainer is available
+            if self.citation_explainer:
+                explanation = self.citation_explainer.explain(
+                    context, resolved, paper.abstract
+                )
+
+                output = f"Explanation for citation '{citation_marker}':\n\n"
+                output += f"**Cited Paper**: {resolved.title}\n"
+                output += f"**Authors**: {', '.join(resolved.authors[:3])}\n"
+                output += f"**ArXiv ID**: {resolved.arxiv_id}\n"
+                output += f"**Published**: {resolved.published}\n\n"
+                output += f"**Relevance Score**: {explanation.relevance_score:.2f}/1.0\n"
+                output += f"**Relationship**: {explanation.relationship_type}\n\n"
+                output += f"**Explanation**:\n{explanation.explanation}\n\n"
+                output += f"**Key Points**:\n"
+                for point in explanation.key_points:
+                    output += f"  - {point}\n"
+                output += f"\n**Citation Context**:\n{context}\n"
+
+                return output
+            else:
+                # Return basic resolution info without explanation
+                output = f"Citation '{citation_marker}' resolved to:\n\n"
+                output += f"**Title**: {resolved.title}\n"
+                output += f"**Authors**: {', '.join(resolved.authors[:3])}\n"
+                output += f"**ArXiv ID**: {resolved.arxiv_id}\n"
+                output += f"**Published**: {resolved.published}\n\n"
+                output += f"**Context**:\n{context}\n\n"
+                output += f"Note: Citation explanation requires API key configuration."
+
+                return output
+
+        except Exception as e:
+            logger.error(f"Error in explain_citation: {e}")
+            return f"Error explaining citation: {str(e)}"

@@ -14,7 +14,7 @@ logger.remove()  # Remove default handler
 logger.add(
     sys.stderr,
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
-    level=config.paths.logs_dir.name if hasattr(config.paths, 'logs_dir') else "INFO",
+    level="INFO",
 )
 logger.add(
     config.paths.logs_dir / "agent.log",
@@ -68,8 +68,12 @@ def initialize_system():
             )
             papers_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize tool registry
-    tool_registry = ToolRegistry(retriever)
+    # Initialize tool registry with API keys for citation intelligence
+    tool_registry = ToolRegistry(
+        retriever,
+        api_key=config.model.api_key,
+        perplexity_api_key=config.model.perplexity_api_key
+    )
 
     # Initialize agent
     if not config.model.api_key:

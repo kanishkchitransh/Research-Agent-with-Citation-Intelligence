@@ -14,8 +14,9 @@ load_dotenv()
 class ModelConfig(BaseModel):
     """LLM model configuration."""
 
-    name: str = Field(default="gemini-2.0-flash-exp")
+    name: str = Field(default="gemini-2.5-flash-lite")
     api_key: str = Field(default_factory=lambda: os.getenv("GOOGLE_API_KEY", ""))
+    perplexity_api_key: str = Field(default_factory=lambda: os.getenv("PERPLEXITY_API_KEY", ""))
     max_tokens: int = Field(default=8192)
     temperature: float = Field(default=0.7)
     top_p: float = Field(default=0.95)

@@ -65,7 +65,7 @@ class ResearchAgent:
         self,
         tool_registry: ToolRegistry,
         api_key: str,
-        model_name: str = "gemini-2.0-flash-exp",
+        model_name: str = "gemini-2.5-flash-lite",
         max_iterations: int = 10,
         temperature: float = 0.7,
         verbose: bool = True,
@@ -253,7 +253,18 @@ class ResearchAgent:
 
                 else:
                     # No more parts, likely done
-                    answer = response.text if hasattr(response, "text") else ""
+                    # Try to get text safely
+                    try:
+                        answer = response.text if response.text else ""
+                    except (ValueError, AttributeError):
+                        # If no valid text part, check if we have function results to summarize
+                        if steps:
+                            # Use the last tool output as the answer
+                            last_step = steps[-1]
+                            answer = f"Based on the {last_step.tool_name} tool:\n\n{last_step.tool_output}"
+                        else:
+                            answer = ""
+
                     return AgentResponse(
                         answer=answer,
                         steps=steps,

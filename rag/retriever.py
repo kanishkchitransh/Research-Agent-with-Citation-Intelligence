@@ -314,14 +314,29 @@ class Retriever:
         # Get metadata from first chunk
         if chunks and chunks[0]["metadata"]:
             metadata = chunks[0]["metadata"]
-            # Create a minimal Paper object
-            # (Note: This won't have the full text or sections properly reconstructed)
+
+            # Reconstruct full text from all chunks (sorted by chunk_id)
+            sorted_chunks = sorted(chunks, key=lambda c: c["metadata"].get("chunk_id", c["id"]))
+            full_text = "\n".join([chunk["text"] for chunk in sorted_chunks])
+
+            # Reconstruct sections (group chunks by section)
+            sections = {}
+            for chunk in chunks:
+                section_name = chunk["metadata"].get("section", "unknown")
+                if section_name not in sections:
+                    sections[section_name] = []
+                sections[section_name].append(chunk["text"])
+
+            # Combine section texts
+            sections = {k: "\n".join(v) for k, v in sections.items()}
+
+            # Create Paper object with reconstructed data
             paper = Paper(
                 paper_id=paper_id,
                 title=metadata.get("title", "Unknown"),
-                full_text="",  # Would need to reconstruct
-                sections={},  # Would need to reconstruct
-                citations=[],
+                full_text=full_text,
+                sections=sections,
+                citations=[],  # Would need separate storage for citations
             )
             self._papers_cache[paper_id] = paper
             return paper
