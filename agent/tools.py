@@ -7,7 +7,9 @@ import arxiv
 import requests
 from loguru import logger
 
+from author_intelligence import AuthorProfileFetcher, InsightGenerator, TrajectoryAnalyzer
 from citation import CitationExplainer, CitationExtractor, CitationResolver
+from rag.cache_manager import CacheManager
 from rag.retriever import Retriever
 
 
@@ -67,6 +69,8 @@ class ToolRegistry:
         """
         self.retriever = retriever
         self.tools: Dict[str, Tool] = {}
+        self.api_key = api_key
+        self.perplexity_api_key = perplexity_api_key
 
         # Initialize citation intelligence components
         self.citation_extractor = CitationExtractor(context_window=200)
@@ -84,6 +88,29 @@ class ToolRegistry:
                 logger.info("Citation intelligence initialized with explainer and search APIs")
             except Exception as e:
                 logger.warning(f"Could not initialize CitationExplainer: {e}")
+
+        # Initialize author intelligence components
+        self.author_profile_fetcher = None
+        self.trajectory_analyzer = None
+        self.insight_generator = None
+
+        if perplexity_api_key:
+            try:
+                self.author_profile_fetcher = AuthorProfileFetcher(
+                    perplexity_api_key=perplexity_api_key,
+                    use_semantic_scholar=True
+                )
+                self.trajectory_analyzer = TrajectoryAnalyzer()
+
+                if api_key:  # Need Gemini for insights
+                    self.insight_generator = InsightGenerator(api_key=api_key)
+
+                logger.info("Author intelligence initialized successfully")
+            except Exception as e:
+                logger.warning(f"Could not initialize author intelligence: {e}")
+
+        # Initialize cache manager
+        self.cache_manager = CacheManager(retriever.vector_store)
 
         self._register_tools()
 
@@ -276,6 +303,72 @@ class ToolRegistry:
                 "required": ["paper_id", "citation_marker"],
             },
             function=self._explain_citation,
+        )
+
+        # Author Intelligence Tools
+        self._register_tool(
+            name="get_author_intelligence",
+            description="Get comprehensive intelligence about a paper's author including career overview, expertise, publications, and relevance to the current paper. Cached permanently.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "author_name": {
+                        "type": "string",
+                        "description": "Full name of the author to research",
+                    },
+                    "paper_id": {
+                        "type": "string",
+                        "description": "ID of the paper (for context)",
+                    },
+                    "detail_level": {
+                        "type": "string",
+                        "description": "Level of detail: 'quick', 'standard', or 'deep'",
+                        "enum": ["quick", "standard", "deep"],
+                    },
+                },
+                "required": ["author_name", "paper_id"],
+            },
+            function=self._get_author_intelligence,
+        )
+
+        self._register_tool(
+            name="fetch_paper_authors",
+            description="Fetch author profiles for all authors of a paper. Prioritizes first and last authors (primary contributors).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "paper_id": {
+                        "type": "string",
+                        "description": "ID of the paper",
+                    },
+                    "focus_primary": {
+                        "type": "boolean",
+                        "description": "If true, only fetch first and last authors immediately",
+                    },
+                },
+                "required": ["paper_id"],
+            },
+            function=self._fetch_paper_authors,
+        )
+
+        self._register_tool(
+            name="should_offer_author_intelligence",
+            description="Check if author intelligence should be offered to the user based on session preferences. Returns whether to ask user.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "paper_id": {
+                        "type": "string",
+                        "description": "ID of the paper just uploaded",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Current session ID",
+                    },
+                },
+                "required": ["paper_id", "session_id"],
+            },
+            function=self._should_offer_author_intelligence,
         )
 
     def _register_tool(
@@ -556,3 +649,271 @@ class ToolRegistry:
         except Exception as e:
             logger.error(f"Error in explain_citation: {e}")
             return f"Error explaining citation: {str(e)}"
+
+    # Author Intelligence Tool Implementations
+
+    def _get_author_intelligence(
+        self,
+        author_name: str,
+        paper_id: str,
+        detail_level: str = "standard",
+    ) -> str:
+        """
+        Get comprehensive author intelligence with caching.
+
+        Args:
+            author_name: Author's full name
+            paper_id: Paper ID for context
+            detail_level: 'quick', 'standard', or 'deep'
+
+        Returns:
+            Formatted author intelligence
+        """
+        if not self.author_profile_fetcher:
+            return "❌ Author intelligence not available (Perplexity API key required)"
+
+        try:
+            # Normalize author name for caching
+            normalized_name = self.author_profile_fetcher.normalize_author_name(author_name)
+
+            # Check cache first (PERMANENT)
+            cached_profile = self.cache_manager.get_cached_author(normalized_name)
+
+            if cached_profile:
+                logger.info(f"✓ Using cached profile for {author_name}")
+                # Generate fresh summary even with cached data
+                profile = cached_profile  # Already a dict
+            else:
+                # Fetch fresh profile
+                logger.info(f"Fetching fresh profile for {author_name}")
+
+                # Get paper context
+                paper = self.retriever._get_paper(paper_id)
+                paper_context = paper.abstract if paper and paper.abstract else None
+
+                # Fetch profile
+                profile_obj = self.author_profile_fetcher.fetch_profile(
+                    author_name=author_name,
+                    paper_context=paper_context
+                )
+
+                # Convert to dict for caching
+                profile = {
+                    "name": profile_obj.name,
+                    "normalized_name": profile_obj.normalized_name,
+                    "institution": profile_obj.institution,
+                    "years_active": profile_obj.years_active,
+                    "expertise_areas": profile_obj.expertise_areas,
+                    "career_overview": profile_obj.career_overview,
+                    "recent_work": profile_obj.recent_work,
+                    "breakthrough_papers": profile_obj.breakthrough_papers,
+                    "current_focus": profile_obj.current_focus,
+                    "publication_count": profile_obj.publication_count,
+                    "citation_count": profile_obj.citation_count,
+                    "h_index": profile_obj.h_index,
+                    "top_papers": profile_obj.top_papers,
+                    "collaborators": profile_obj.collaborators,
+                    "fetched_at": profile_obj.fetched_at,
+                    "sources_used": profile_obj.sources_used,
+                }
+
+                # Cache permanently
+                self.cache_manager.store_author_cache(normalized_name, profile)
+                logger.info(f"✓ Cached profile for {author_name} permanently")
+
+            # Generate summary based on detail level
+            output = f"## Author Intelligence: {author_name}\n\n"
+
+            if detail_level == "quick":
+                # Quick summary (for UI cards)
+                output += f"**Institution:** {profile.get('institution', 'Unknown')}\n"
+                output += f"**Expertise:** {', '.join(profile.get('expertise_areas', [])[:3])}\n"
+                output += f"**Publications:** {profile.get('publication_count', 0)} papers, "
+                output += f"{profile.get('citation_count', 0)} citations (h-index: {profile.get('h_index', 0)})\n\n"
+
+                if profile.get('current_focus'):
+                    output += f"**Current Focus:** {profile.get('current_focus')}\n"
+
+            elif detail_level == "standard":
+                # Standard summary with trajectory
+                output += f"**Institution:** {profile.get('institution', 'Unknown')}\n"
+                output += f"**Expertise Areas:** {', '.join(profile.get('expertise_areas', []))}\n"
+                output += f"**Years Active:** {profile.get('years_active', 'Active researcher')}\n\n"
+
+                output += f"**Publication Metrics:**\n"
+                output += f"- Papers: {profile.get('publication_count', 0)}\n"
+                output += f"- Citations: {profile.get('citation_count', 0)}\n"
+                output += f"- H-index: {profile.get('h_index', 0)}\n\n"
+
+                if profile.get('career_overview'):
+                    output += f"**Career Overview:**\n{profile.get('career_overview')[:500]}...\n\n"
+
+                if profile.get('top_papers'):
+                    output += "**Notable Papers:**\n"
+                    for paper in profile.get('top_papers', [])[:3]:
+                        output += f"- {paper['title']} ({paper['year']}) - {paper['citations']} citations\n"
+                    output += "\n"
+
+            elif detail_level == "deep":
+                # Deep analysis with all details
+                output += self._format_deep_author_analysis(profile)
+
+            output += f"\n*Data sources: {', '.join(profile.get('sources_used', []))}, cached permanently*"
+
+            return output
+
+        except Exception as e:
+            logger.error(f"Error in get_author_intelligence: {e}")
+            return f"❌ Error fetching author intelligence: {str(e)}"
+
+    def _fetch_paper_authors(self, paper_id: str, focus_primary: bool = True) -> str:
+        """
+        Fetch profiles for all authors of a paper.
+
+        Args:
+            paper_id: Paper ID
+            focus_primary: If True, prioritize first and last authors
+
+        Returns:
+            Formatted list of author profiles
+        """
+        if not self.author_profile_fetcher:
+            return "❌ Author intelligence not available"
+
+        try:
+            # Get paper
+            paper = self.retriever._get_paper(paper_id)
+
+            if not paper:
+                return f"❌ Paper '{paper_id}' not found"
+
+            # Extract author names (for MVP, assume from paper metadata)
+            # In production, would parse from PDF properly
+            author_names = []
+
+            # Try to extract from paper title/abstract (simplified)
+            if hasattr(paper, 'authors') and paper.authors:
+                author_names = paper.authors
+            else:
+                return f"⚠️ No author information found for paper '{paper_id}'"
+
+            if not author_names:
+                return f"⚠️ Could not extract author names from paper"
+
+            # Fetch profiles
+            profiles = self.author_profile_fetcher.fetch_multiple_authors(
+                author_names,
+                prioritize_first_last=focus_primary
+            )
+
+            # Format output
+            output = f"## Authors of '{paper.title}'\n\n"
+            output += f"Found {len(profiles)} authors:\n\n"
+
+            for i, profile_obj in enumerate(profiles, 1):
+                output += f"### {i}. {profile_obj.name}\n"
+                output += f"- Institution: {profile_obj.institution or 'Unknown'}\n"
+                output += f"- Expertise: {', '.join(profile_obj.expertise_areas[:2]) if profile_obj.expertise_areas else 'N/A'}\n"
+                output += f"- Publications: {profile_obj.publication_count} ({profile_obj.h_index} h-index)\n"
+
+                if i <= 1 or i == len(profiles):  # First or last
+                    output += f"  *Primary author - full profile available*\n"
+
+                output += "\n"
+
+            return output
+
+        except Exception as e:
+            logger.error(f"Error in fetch_paper_authors: {e}")
+            return f"❌ Error fetching authors: {str(e)}"
+
+    def _should_offer_author_intelligence(self, paper_id: str, session_id: str) -> str:
+        """
+        Check if author intelligence should be offered based on session preferences.
+
+        Args:
+            paper_id: Paper ID just uploaded
+            session_id: Current session ID
+
+        Returns:
+            JSON string with {should_offer: bool, message: str}
+        """
+        try:
+            # Check session preference
+            declined = self.cache_manager.get_session_preference(
+                session_id,
+                "author_intelligence_declined"
+            )
+
+            if declined:
+                logger.info(f"User previously declined author intelligence in session {session_id}")
+                return json.dumps({
+                    "should_offer": False,
+                    "message": "User previously declined author intelligence this session"
+                })
+
+            # Get paper details
+            paper = self.retriever._get_paper(paper_id)
+
+            if not paper:
+                return json.dumps({
+                    "should_offer": False,
+                    "message": "Paper not found"
+                })
+
+            # Suggest asking user
+            message = f"Would you like to know about the authors of '{paper.title}'? " \
+                      f"I can provide background on their research and expertise."
+
+            return json.dumps({
+                "should_offer": True,
+                "message": message,
+                "paper_title": paper.title
+            })
+
+        except Exception as e:
+            logger.error(f"Error in should_offer_author_intelligence: {e}")
+            return json.dumps({
+                "should_offer": False,
+                "message": f"Error: {str(e)}"
+            })
+
+    def _format_deep_author_analysis(self, profile: Dict) -> str:
+        """Format deep author analysis."""
+        output = ""
+
+        # Full details
+        output += f"**Name:** {profile.get('name')}\n"
+        output += f"**Institution:** {profile.get('institution', 'Unknown')}\n"
+        output += f"**Normalized Name:** {profile.get('normalized_name')}\n"
+        output += f"**Years Active:** {profile.get('years_active', 'Active')}\n"
+        output += f"**Expertise Areas:** {', '.join(profile.get('expertise_areas', []))}\n\n"
+
+        output += f"**Publication Metrics:**\n"
+        output += f"- Total Papers: {profile.get('publication_count', 0)}\n"
+        output += f"- Total Citations: {profile.get('citation_count', 0)}\n"
+        output += f"- H-index: {profile.get('h_index', 0)}\n\n"
+
+        if profile.get('career_overview'):
+            output += f"**Career Overview:**\n{profile.get('career_overview')}\n\n"
+
+        if profile.get('recent_work'):
+            output += f"**Recent Work:**\n{profile.get('recent_work')}\n\n"
+
+        if profile.get('current_focus'):
+            output += f"**Current Focus:**\n{profile.get('current_focus')}\n\n"
+
+        if profile.get('top_papers'):
+            output += "**Top Papers (by citations):**\n"
+            for paper in profile.get('top_papers', [])[:5]:
+                output += f"- **{paper['title']}** ({paper['year']})\n"
+                output += f"  Citations: {paper['citations']}\n"
+            output += "\n"
+
+        if profile.get('collaborators'):
+            output += f"**Key Collaborators:** {', '.join(profile.get('collaborators', [])[:10])}\n\n"
+
+        output += f"**Data Sources:** {', '.join(profile.get('sources_used', []))}\n"
+        output += f"**Last Updated:** {profile.get('fetched_at')}\n"
+
+        return output
