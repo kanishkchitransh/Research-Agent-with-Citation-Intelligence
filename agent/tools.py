@@ -9,6 +9,7 @@ from loguru import logger
 
 from author_intelligence import AuthorProfileFetcher, InsightGenerator, TrajectoryAnalyzer
 from citation import CitationExplainer, CitationExtractor, CitationResolver
+from field_intelligence import DomainAnalyzer, TrendDetector, FieldInsightGenerator
 from rag.cache_manager import CacheManager
 from rag.retriever import Retriever
 
@@ -108,6 +109,23 @@ class ToolRegistry:
                 logger.info("Author intelligence initialized successfully")
             except Exception as e:
                 logger.warning(f"Could not initialize author intelligence: {e}")
+
+        # Initialize field intelligence components
+        self.domain_analyzer = None
+        self.trend_detector = None
+        self.field_insight_generator = None
+
+        if perplexity_api_key:
+            try:
+                self.domain_analyzer = DomainAnalyzer(perplexity_api_key=perplexity_api_key)
+                self.trend_detector = TrendDetector(perplexity_api_key=perplexity_api_key)
+
+                if api_key:  # Need Gemini for field insights
+                    self.field_insight_generator = FieldInsightGenerator(api_key=api_key)
+
+                logger.info("Field intelligence initialized successfully")
+            except Exception as e:
+                logger.warning(f"Could not initialize field intelligence: {e}")
 
         # Initialize cache manager
         self.cache_manager = CacheManager(retriever.vector_store)
@@ -369,6 +387,91 @@ class ToolRegistry:
                 "required": ["paper_id", "session_id"],
             },
             function=self._should_offer_author_intelligence,
+        )
+
+        # Field Intelligence Tools
+        self._register_tool(
+            name="get_field_intelligence",
+            description="Get comprehensive intelligence about a research field including current state, trends, breakthroughs, and future directions. Cached for 30 days.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "field_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Keywords representing the field (e.g., ['transformers', 'attention', 'NLP'])",
+                    },
+                    "paper_context": {
+                        "type": "string",
+                        "description": "Optional paper title/abstract for context",
+                    },
+                    "detail_level": {
+                        "type": "string",
+                        "description": "Level of detail: 'quick', 'standard', or 'deep'",
+                        "enum": ["quick", "standard", "deep"],
+                    },
+                },
+                "required": ["field_keywords"],
+            },
+            function=self._get_field_intelligence,
+        )
+
+        self._register_tool(
+            name="extract_field_keywords",
+            description="Extract key research field keywords from a paper using AI. Use this to identify the research domain before getting field intelligence.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "paper_id": {
+                        "type": "string",
+                        "description": "ID of the paper to analyze",
+                    },
+                    "max_keywords": {
+                        "type": "integer",
+                        "description": "Maximum number of keywords to extract (default: 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["paper_id"],
+            },
+            function=self._extract_field_keywords,
+        )
+
+        self._register_tool(
+            name="analyze_field_trends",
+            description="Analyze recent trends and breakthroughs in a research field. Returns emerging trends, hot topics, and future directions.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "field_name": {
+                        "type": "string",
+                        "description": "Name of the research field (e.g., 'Natural Language Processing', 'Computer Vision')",
+                    },
+                    "field_keywords": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional keywords for more specific trend analysis",
+                    },
+                },
+                "required": ["field_name"],
+            },
+            function=self._analyze_field_trends,
+        )
+
+        self._register_tool(
+            name="get_field_context",
+            description="Get quick field context for a paper - combines keyword extraction and field intelligence in one step.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "paper_id": {
+                        "type": "string",
+                        "description": "ID of the paper",
+                    },
+                },
+                "required": ["paper_id"],
+            },
+            function=self._get_field_context,
         )
 
     def _register_tool(
@@ -916,4 +1019,337 @@ class ToolRegistry:
         output += f"**Data Sources:** {', '.join(profile.get('sources_used', []))}\n"
         output += f"**Last Updated:** {profile.get('fetched_at')}\n"
 
+        return output
+
+    # Field Intelligence Tool Implementations
+
+    def _get_field_intelligence(
+        self,
+        field_keywords: List[str],
+        paper_context: Optional[str] = None,
+        detail_level: str = "standard",
+    ) -> str:
+        """
+        Get comprehensive field intelligence with caching.
+
+        Args:
+            field_keywords: Keywords representing the field
+            paper_context: Optional paper context
+            detail_level: 'quick', 'standard', or 'deep'
+
+        Returns:
+            Formatted field intelligence
+        """
+        if not self.domain_analyzer:
+            return "❌ Field intelligence not available (Perplexity API key required)"
+
+        try:
+            # Create hash for caching (keywords + context)
+            import hashlib
+            cache_key_data = '|'.join(sorted(field_keywords))
+            if paper_context:
+                cache_key_data += f"|{paper_context[:100]}"
+            domain_hash = hashlib.md5(cache_key_data.encode()).hexdigest()
+
+            logger.info(f"Getting field intelligence for keywords: {field_keywords}")
+
+            # Check cache first (30-day TTL)
+            cached_field = self.cache_manager.get_cached_field(domain_hash)
+
+            if cached_field:
+                logger.info(f"✓ Using cached field data")
+                field_profile = cached_field.get('field_profile')
+                trends = cached_field.get('trends')
+            else:
+                logger.info(f"Fetching fresh field data")
+
+                # Analyze domain
+                field_profile_obj = self.domain_analyzer.analyze_field(
+                    field_keywords=field_keywords,
+                    paper_context=paper_context
+                )
+
+                # Detect trends
+                trends_obj = None
+                if self.trend_detector:
+                    trends_obj = self.trend_detector.detect_trends(
+                        field_name=field_profile_obj.field_name,
+                        field_keywords=field_keywords
+                    )
+
+                # Convert to dict for caching
+                field_profile = field_profile_obj.to_dict()
+                trends = trends_obj.to_dict() if trends_obj else None
+
+                # Cache for 30 days
+                cache_data = {
+                    'field_profile': field_profile,
+                    'trends': trends
+                }
+                self.cache_manager.store_field_cache(domain_hash, cache_data)
+
+            # Generate output based on detail level
+            if detail_level == "quick":
+                if self.field_insight_generator:
+                    from field_intelligence import FieldProfile
+                    profile_obj = FieldProfile.from_dict(field_profile)
+                    return self.field_insight_generator.generate_quick_summary(
+                        profile_obj,
+                        paper_context
+                    )
+                else:
+                    return self._format_quick_field_summary(field_profile)
+
+            elif detail_level == "standard":
+                if self.field_insight_generator and trends:
+                    from field_intelligence import FieldProfile, FieldTrends
+                    profile_obj = FieldProfile.from_dict(field_profile)
+                    trends_obj = FieldTrends.from_dict(trends) if trends else None
+                    return self.field_insight_generator.generate_standard_analysis(
+                        profile_obj,
+                        trends_obj,
+                        paper_context
+                    )
+                else:
+                    return self._format_standard_field_analysis(field_profile, trends)
+
+            elif detail_level == "deep":
+                if self.field_insight_generator and trends:
+                    from field_intelligence import FieldProfile, FieldTrends
+                    profile_obj = FieldProfile.from_dict(field_profile)
+                    trends_obj = FieldTrends.from_dict(trends)
+                    sections = self.field_insight_generator.generate_deep_analysis(
+                        profile_obj,
+                        trends_obj,
+                        paper_context
+                    )
+                    return self._format_deep_field_sections(sections)
+                else:
+                    return self._format_deep_field_analysis(field_profile, trends)
+
+        except Exception as e:
+            logger.error(f"Error in get_field_intelligence: {e}")
+            return f"❌ Error fetching field intelligence: {str(e)}"
+
+    def _extract_field_keywords(
+        self,
+        paper_id: str,
+        max_keywords: int = 5
+    ) -> str:
+        """
+        Extract field keywords from a paper using AI.
+
+        Args:
+            paper_id: Paper ID
+            max_keywords: Maximum keywords to extract
+
+        Returns:
+            JSON string with extracted keywords
+        """
+        if not self.field_insight_generator:
+            return json.dumps({
+                "success": False,
+                "error": "Keyword extraction requires Gemini API key"
+            })
+
+        try:
+            # Get paper
+            paper = self.retriever._get_paper(paper_id)
+
+            if not paper:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Paper '{paper_id}' not found"
+                })
+
+            # Use Gemini to extract keywords
+            import google.generativeai as genai
+
+            prompt = f"""Extract {max_keywords} key research field keywords from this paper.
+
+Title: {paper.title}
+Abstract: {paper.abstract[:500] if paper.abstract else 'Not available'}
+
+Return ONLY a comma-separated list of keywords (e.g., "transformers, attention mechanism, NLP, language models, deep learning").
+Focus on field/domain keywords, not specific techniques."""
+
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            response = model.generate_content(prompt)
+            keywords_str = response.text.strip()
+
+            # Parse keywords
+            keywords = [k.strip() for k in keywords_str.split(',')][:max_keywords]
+
+            return json.dumps({
+                "success": True,
+                "keywords": keywords,
+                "paper_title": paper.title
+            })
+
+        except Exception as e:
+            logger.error(f"Error extracting keywords: {e}")
+            return json.dumps({
+                "success": False,
+                "error": str(e)
+            })
+
+    def _analyze_field_trends(
+        self,
+        field_name: str,
+        field_keywords: Optional[List[str]] = None
+    ) -> str:
+        """
+        Analyze trends in a research field.
+
+        Args:
+            field_name: Name of the field
+            field_keywords: Optional keywords for specific analysis
+
+        Returns:
+            Formatted trends analysis
+        """
+        if not self.trend_detector:
+            return "❌ Trend analysis not available (Perplexity API key required)"
+
+        try:
+            logger.info(f"Analyzing trends for field: {field_name}")
+
+            # Detect trends
+            trends = self.trend_detector.detect_trends(
+                field_name=field_name,
+                field_keywords=field_keywords
+            )
+
+            # Format output
+            output = f"## 🔬 Field Trends: {field_name}\n\n"
+
+            output += "### 🚀 Recent Breakthroughs (Last 2-3 Years)\n"
+            for i, breakthrough in enumerate(trends.recent_breakthroughs, 1):
+                output += f"{i}. {breakthrough}\n"
+            output += "\n"
+
+            output += "### 📈 Emerging Trends\n"
+            for i, trend in enumerate(trends.emerging_trends, 1):
+                output += f"{i}. {trend}\n"
+            output += "\n"
+
+            output += "### 🎯 Future Research Directions\n"
+            for i, direction in enumerate(trends.research_directions, 1):
+                output += f"{i}. {direction}\n"
+            output += "\n"
+
+            output += "### 🔥 Hot Topics\n"
+            for i, topic in enumerate(trends.hot_topics, 1):
+                output += f"{i}. {topic}\n"
+            output += "\n"
+
+            output += "### ⚠️ Key Challenges\n"
+            for i, challenge in enumerate(trends.key_challenges, 1):
+                output += f"{i}. {challenge}\n"
+            output += "\n"
+
+            if trends.timeline_summary:
+                output += f"### 📅 Evolution\n{trends.timeline_summary}\n\n"
+
+            if trends.impact_areas:
+                output += "### 🌍 Real-World Impact\n"
+                for i, impact in enumerate(trends.impact_areas, 1):
+                    output += f"{i}. {impact}\n"
+
+            return output
+
+        except Exception as e:
+            logger.error(f"Error analyzing trends: {e}")
+            return f"❌ Error analyzing trends: {str(e)}"
+
+    def _get_field_context(self, paper_id: str) -> str:
+        """
+        Get quick field context for a paper (combines keyword extraction + field intelligence).
+
+        Args:
+            paper_id: Paper ID
+
+        Returns:
+            Formatted field context
+        """
+        try:
+            # First, extract keywords
+            keywords_result = self._extract_field_keywords(paper_id, max_keywords=5)
+            keywords_data = json.loads(keywords_result)
+
+            if not keywords_data.get('success'):
+                return f"❌ Could not extract keywords: {keywords_data.get('error')}"
+
+            keywords = keywords_data.get('keywords', [])
+
+            if not keywords:
+                return "❌ No keywords extracted from paper"
+
+            # Get paper context
+            paper = self.retriever._get_paper(paper_id)
+            paper_context = f"{paper.title}\n{paper.abstract[:200]}" if paper and paper.abstract else paper.title if paper else None
+
+            # Get field intelligence
+            field_intel = self._get_field_intelligence(
+                field_keywords=keywords,
+                paper_context=paper_context,
+                detail_level="standard"
+            )
+
+            # Combine results
+            output = f"## 📊 Field Context for '{paper.title}'\n\n"
+            output += f"**Extracted Keywords:** {', '.join(keywords)}\n\n"
+            output += "---\n\n"
+            output += field_intel
+
+            return output
+
+        except Exception as e:
+            logger.error(f"Error getting field context: {e}")
+            return f"❌ Error getting field context: {str(e)}"
+
+    # Field Intelligence Formatting Helpers
+
+    def _format_quick_field_summary(self, field_profile: Dict) -> str:
+        """Fallback quick field summary."""
+        return f"""**{field_profile.get('field_name')}** ({field_profile.get('primary_domain')})
+
+{field_profile.get('description', 'No description available')[:200]}...
+
+Key areas: {', '.join(field_profile.get('subdomains', [])[:3])}"""
+
+    def _format_standard_field_analysis(self, field_profile: Dict, trends: Optional[Dict]) -> str:
+        """Fallback standard field analysis."""
+        output = f"## 🔬 {field_profile.get('field_name')}\n\n"
+        output += f"**Domain:** {field_profile.get('primary_domain')}\n\n"
+        output += f"**Description:** {field_profile.get('description')}\n\n"
+        output += f"**Subdomains:** {', '.join(field_profile.get('subdomains', []))}\n\n"
+        output += f"**Key Concepts:** {', '.join(field_profile.get('key_concepts', [])[:5])}\n\n"
+        output += f"**Major Venues:** {', '.join(field_profile.get('major_venues', [])[:3])}\n\n"
+
+        if trends:
+            output += "### Recent Trends\n\n"
+            output += f"**Breakthroughs:** {', '.join(trends.get('recent_breakthroughs', [])[:3])}\n\n"
+            output += f"**Emerging:** {', '.join(trends.get('emerging_trends', [])[:3])}\n\n"
+
+        return output
+
+    def _format_deep_field_analysis(self, field_profile: Dict, trends: Optional[Dict]) -> str:
+        """Fallback deep field analysis."""
+        output = self._format_standard_field_analysis(field_profile, trends)
+
+        output += f"\n**Current State:** {field_profile.get('current_state', 'Not available')}\n\n"
+        output += f"**Key Researchers:** {', '.join(field_profile.get('key_researchers', []))}\n\n"
+
+        if trends:
+            output += f"**Future Directions:** {', '.join(trends.get('research_directions', []))}\n\n"
+            output += f"**Key Challenges:** {', '.join(trends.get('key_challenges', []))}\n"
+
+        return output
+
+    def _format_deep_field_sections(self, sections: Dict[str, str]) -> str:
+        """Format deep field sections from Gemini."""
+        output = ""
+        for section_name, content in sections.items():
+            output += f"## {section_name}\n\n{content}\n\n"
         return output

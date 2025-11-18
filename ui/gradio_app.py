@@ -152,22 +152,32 @@ def get_author_intelligence_for_paper(paper_id: str, session_id: str, detail_lev
         return error_msg
 
 
-def get_field_intelligence_placeholder(paper_id: str) -> str:
-    """Placeholder for field intelligence (to be implemented)."""
-    return """## 🔬 Field Intelligence (Coming Soon)
+def get_field_intelligence_for_paper(paper_id: str) -> str:
+    """Get field intelligence for the current paper."""
+    global agent
 
-**This feature will provide:**
-- Research field/domain analysis
-- Current state of the art
-- Recent breakthroughs and trends
-- Key research directions
-- Related subfields and connections
+    if agent is None:
+        return "❌ Please initialize the system first by uploading a paper."
 
-**Implementation Status:** Ready for Phase 2
+    if not paper_id:
+        return "❌ Please upload a paper first!"
 
-**Note:** This requires the Field Intelligence module to be implemented.
-Contact the developer if you need this feature prioritized!
-"""
+    try:
+        print(f"🔬 Fetching field intelligence for paper: {paper_id}")
+
+        # Use agent to get field context (combines keyword extraction + field intelligence)
+        field_query = f"Get comprehensive field context for paper '{paper_id}'"
+        field_response = agent.query(field_query)
+
+        if field_response.success:
+            return field_response.answer
+        else:
+            return f"❌ Could not generate field intelligence: {field_response.error}"
+
+    except Exception as e:
+        error_msg = f"❌ Error fetching field intelligence: {str(e)}"
+        print(error_msg)
+        return error_msg
 
 
 def reset_session_preferences(session_id: str) -> str:
@@ -397,7 +407,7 @@ with gr.Blocks(
     - 🌐 **Find cited papers on the web** (ArXiv, IEEE, ACM, Google Scholar, etc.)
     - 💡 **AI explains WHY papers cite each other**
     - 👤 **Author Intelligence**: Get comprehensive author profiles
-    - 🔬 **Field Intelligence**: Understand research field context (Coming Soon)
+    - 🔬 **Field Intelligence**: Analyze research domains, trends, and breakthroughs
 
     ---
 
@@ -485,11 +495,12 @@ with gr.Blocks(
                 gr.Markdown("""
                 **Understand the research field context:**
                 - Current state of the art
-                - Recent breakthroughs and trends
-                - Key research directions
-                - Related subfields
+                - Recent breakthroughs and trends (last 2-3 years)
+                - Key research directions and challenges
+                - Hot topics and emerging areas
+                - Field evolution and timeline
 
-                *This feature is ready for Phase 2 implementation*
+                *Automatically extracts keywords and analyzes the research domain*
                 """)
 
                 fetch_field_btn = gr.Button(
@@ -498,7 +509,7 @@ with gr.Blocks(
                 )
 
                 field_intelligence_output = gr.Markdown(
-                    "*Field intelligence will be available in Phase 2*"
+                    "*Click 'Fetch Field Intelligence' to get comprehensive analysis of the research field*"
                 )
 
             gr.Markdown("---")
@@ -643,9 +654,9 @@ with gr.Blocks(
         outputs=[author_intelligence_output]
     )
 
-    # NEW: Field Intelligence event handler (placeholder)
+    # NEW: Field Intelligence event handler
     fetch_field_btn.click(
-        fn=lambda state: get_field_intelligence_placeholder(state.get("current_paper_id", "")),
+        fn=lambda state: get_field_intelligence_for_paper(state.get("current_paper_id", "")),
         inputs=[session_state],
         outputs=[field_intelligence_output]
     )
@@ -654,9 +665,9 @@ with gr.Blocks(
     gr.Markdown("""
     ---
     <div style="text-align: center; color: #666;">
-        <p>🔬 Research Agent with Citation Intelligence + Author Intelligence | Built with ❤️ for Researchers</p>
+        <p>🔬 Research Agent with Citation + Author + Field Intelligence | Built with ❤️ for Researchers</p>
         <p>Powered by Gemini 2.0 Flash + Perplexity AI + Semantic Scholar + ChromaDB</p>
-        <p><small>Session ID: Unique per browser session | Preferences are cached for optimal experience</small></p>
+        <p><small>Session ID: Unique per browser session | Field intelligence cached for 30 days</small></p>
     </div>
     """)
 
