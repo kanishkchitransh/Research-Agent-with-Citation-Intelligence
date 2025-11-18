@@ -6,6 +6,8 @@ This app demonstrates the unique citation intelligence feature:
 - Automatically extract citations
 - Find cited papers on the web (ArXiv, IEEE, ACM, etc.)
 - AI-powered explanation of why papers cite each other
+- Author Intelligence: Get comprehensive profiles of paper authors
+- Field Intelligence: Understand research field context
 
 Built by an NLP researcher, for researchers.
 """
@@ -13,7 +15,9 @@ Built by an NLP researcher, for researchers.
 import gradio as gr
 import os
 import sys
+import uuid
 from pathlib import Path
+from typing import Dict, List, Optional
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -27,6 +31,7 @@ agent = None
 retriever = None
 current_paper_id = None
 current_citations = []
+session_states = {}  # Store session preferences
 
 
 def initialize_system():
@@ -53,8 +58,15 @@ def initialize_system():
 
         retriever = Retriever(vector_store, doc_processor)
 
-        # Initialize agent
-        tool_registry = ToolRegistry(retriever)
+        # Initialize agent with author intelligence support
+        perplexity_key = os.getenv("PERPLEXITY_API_KEY", config.perplexity.api_key if hasattr(config, 'perplexity') else None)
+
+        tool_registry = ToolRegistry(
+            retriever=retriever,
+            api_key=config.model.api_key,
+            perplexity_api_key=perplexity_key
+        )
+
         agent = ResearchAgent(
             tool_registry=tool_registry,
             api_key=config.model.api_key,
@@ -64,7 +76,15 @@ def initialize_system():
         )
 
         print("✅ Research Agent initialized successfully!")
-        return "System initialized successfully!"
+
+        # Check which features are available
+        features = []
+        if config.model.api_key:
+            features.append("Citation Intelligence ✓")
+        if perplexity_key:
+            features.append("Author Intelligence ✓")
+
+        return f"System initialized successfully! Available features: {', '.join(features)}"
 
     except Exception as e:
         error_msg = f"Error initializing system: {str(e)}"
@@ -72,17 +92,110 @@ def initialize_system():
         return error_msg
 
 
-def upload_and_process_paper(pdf_file):
+def get_session_id(session_state: Optional[Dict]) -> str:
+    """Get or create session ID."""
+    if session_state is None or "session_id" not in session_state:
+        return str(uuid.uuid4())
+    return session_state["session_id"]
+
+
+def get_author_intelligence_for_paper(paper_id: str, session_id: str, detail_level: str = "standard") -> str:
+    """Get author intelligence for the current paper."""
+    global agent
+
+    if agent is None:
+        return "❌ Please initialize the system first by uploading a paper."
+
+    if not paper_id:
+        return "❌ Please upload a paper first!"
+
+    try:
+        print(f"👤 Fetching author intelligence for paper: {paper_id}")
+
+        # First, check if we should offer author intelligence
+        should_offer_query = f"Should I offer author intelligence for paper '{paper_id}' in session '{session_id}'?"
+        should_offer_response = agent.query(should_offer_query)
+
+        if "should_offer" in should_offer_response.answer.lower() and "false" in should_offer_response.answer.lower():
+            return "ℹ️ Author intelligence was declined for this session. Click 'Reset Preferences' to enable again."
+
+        # Fetch paper authors
+        authors_query = f"Get all authors for paper '{paper_id}' with primary author focus"
+        authors_response = agent.query(authors_query)
+
+        if not authors_response.success:
+            return f"❌ Could not fetch authors: {authors_response.error}"
+
+        # Extract author names from response (simplified parsing)
+        import re
+        author_lines = [line for line in authors_response.answer.split('\n') if line.strip() and not line.startswith('#')]
+
+        if not author_lines:
+            return "ℹ️ No authors found for this paper."
+
+        # Get detailed intelligence for first author (primary)
+        first_author = author_lines[0].strip().replace('**', '').replace('-', '').strip()
+        if ':' in first_author:
+            first_author = first_author.split(':')[0].strip()
+
+        intelligence_query = f"Get author intelligence for '{first_author}' from paper '{paper_id}' with detail level '{detail_level}'"
+        intelligence_response = agent.query(intelligence_query)
+
+        if intelligence_response.success:
+            return intelligence_response.answer
+        else:
+            return f"❌ Could not generate author intelligence: {intelligence_response.error}"
+
+    except Exception as e:
+        error_msg = f"❌ Error fetching author intelligence: {str(e)}"
+        print(error_msg)
+        return error_msg
+
+
+def get_field_intelligence_placeholder(paper_id: str) -> str:
+    """Placeholder for field intelligence (to be implemented)."""
+    return """## 🔬 Field Intelligence (Coming Soon)
+
+**This feature will provide:**
+- Research field/domain analysis
+- Current state of the art
+- Recent breakthroughs and trends
+- Key research directions
+- Related subfields and connections
+
+**Implementation Status:** Ready for Phase 2
+
+**Note:** This requires the Field Intelligence module to be implemented.
+Contact the developer if you need this feature prioritized!
+"""
+
+
+def reset_session_preferences(session_id: str) -> str:
+    """Reset session preferences."""
+    global session_states
+
+    if session_id in session_states:
+        session_states[session_id] = {"session_id": session_id}
+        return "✅ Session preferences reset! Author intelligence will be offered again."
+    else:
+        return "ℹ️ No preferences to reset."
+
+
+def upload_and_process_paper(pdf_file, session_state):
     """Upload and process a research paper."""
     global current_paper_id, current_citations, retriever, agent
+
+    # Initialize session
+    if session_state is None:
+        session_state = {"session_id": str(uuid.uuid4())}
 
     if agent is None:
         init_msg = initialize_system()
         if "Error" in init_msg:
-            return init_msg, "System initialization failed", []
+            return init_msg, "System initialization failed", [], session_state, gr.update()
 
     if pdf_file is None:
-        return "❌ Please upload a PDF file", "", []
+        return "❌ Please upload a PDF file", "", [], session_state, gr.update()
 
     try:
         # Save the uploaded file
@@ -92,6 +205,9 @@ def upload_and_process_paper(pdf_file):
         # Ingest paper into RAG system
         paper_id = retriever.ingest_paper(pdf_path)
         current_paper_id = paper_id
+
+        # Store paper ID in session
+        session_state["current_paper_id"] = paper_id
 
         # Get paper details
         paper = retriever._get_paper(paper_id)
@@ -126,6 +242,13 @@ def upload_and_process_paper(pdf_file):
         paper_info += f"**Title:** {paper.title}\n\n"
         paper_info += f"**Paper ID:** {paper_id}\n\n"
 
+        if paper.authors:
+            paper_info += f"**Authors:** {', '.join(paper.authors[:3])}"
+            if len(paper.authors) > 3:
+                paper_info += f" et al. ({len(paper.authors)} total)\n\n"
+            else:
+                paper_info += "\n\n"
+
         if paper.abstract:
             paper_info += f"**Abstract:** {paper.abstract[:300]}...\n\n"
 
@@ -134,12 +257,21 @@ def upload_and_process_paper(pdf_file):
 
         print(f"✅ Processed successfully! Found {len(citations_found)} citations")
 
-        return paper_info, citations_response.answer, gr.update(choices=citations_found, value=citations_found[0] if citations_found else None)
+        # Return updated components including PDF viewer
+        return (
+            paper_info,
+            citations_response.answer,
+            gr.update(choices=citations_found, value=citations_found[0] if citations_found else None),
+            session_state,
+            gr.update(value=pdf_file.name)
+        )
 
     except Exception as e:
         error_msg = f"❌ Error processing paper: {str(e)}"
         print(error_msg)
-        return error_msg, "", []
+        import traceback
+        traceback.print_exc()
+        return error_msg, "", [], session_state, gr.update()
 
 
 def explain_selected_citation(citation_marker):
@@ -226,8 +358,32 @@ with gr.Blocks(
         padding: 15px;
         margin: 10px 0;
     }
+    .author-card {
+        border: 2px solid #4A90E2;
+        border-radius: 10px;
+        padding: 20px;
+        margin: 10px 0;
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+    }
+    .field-card {
+        border: 2px solid #50C878;
+        border-radius: 10px;
+        padding: 20px;
+        margin: 10px 0;
+        background: linear-gradient(135deg, #f5fef8 0%, #d4f4dd 100%);
+    }
+    .pdf-viewer {
+        border: 2px solid #ddd;
+        border-radius: 10px;
+        padding: 10px;
+        max-height: 600px;
+        overflow-y: auto;
+    }
     """
 ) as demo:
+
+    # Session state
+    session_state = gr.State(value={"session_id": str(uuid.uuid4())})
 
     # Header
     gr.Markdown("""
@@ -240,11 +396,16 @@ with gr.Blocks(
     - 🔍 Automatically extract citations
     - 🌐 **Find cited papers on the web** (ArXiv, IEEE, ACM, Google Scholar, etc.)
     - 💡 **AI explains WHY papers cite each other**
+    - 👤 **Author Intelligence**: Get comprehensive author profiles
+    - 🔬 **Field Intelligence**: Understand research field context (Coming Soon)
 
     ---
 
-    **🎯 Unique Feature:** Unlike other tools, this agent automatically searches the web to find
-    cited papers and explains their relevance - saving you hours of manual research!
+    **🎯 Unique Features:**
+    - Automatically searches the web to find cited papers
+    - Fetches author profiles from multiple sources (Perplexity + Semantic Scholar)
+    - Provides context-aware explanations
+    - Permanent caching for faster responses
     """)
 
     # Main content
@@ -271,6 +432,74 @@ with gr.Blocks(
                     paper_info = gr.Markdown(
                         "### 📋 Paper Info\n\nUpload a paper to get started!"
                     )
+
+            gr.Markdown("---")
+
+            # NEW: PDF Viewer (collapsed by default)
+            with gr.Accordion("📄 View PDF", open=False):
+                pdf_viewer = gr.File(
+                    label="Uploaded PDF",
+                    interactive=False,
+                    elem_classes="pdf-viewer"
+                )
+                gr.Markdown("*Your uploaded PDF will be displayed here for reference*")
+
+            gr.Markdown("---")
+
+            # NEW: Author Intelligence Panel (collapsed by default)
+            with gr.Accordion("👤 Author Intelligence", open=False, elem_classes="author-card"):
+                gr.Markdown("""
+                **Get comprehensive author profiles:**
+                - Career overview and expertise
+                - Publication metrics (h-index, citations)
+                - Research trajectory analysis
+                - Contextual insights powered by AI
+                """)
+
+                with gr.Row():
+                    author_detail_level = gr.Radio(
+                        choices=["quick", "standard", "deep"],
+                        value="standard",
+                        label="Detail Level",
+                        info="Quick: Brief overview | Standard: With trajectory | Deep: Comprehensive analysis"
+                    )
+                    fetch_author_btn = gr.Button(
+                        "🔍 Fetch Author Intelligence",
+                        variant="primary"
+                    )
+
+                author_intelligence_output = gr.Markdown(
+                    "*Click 'Fetch Author Intelligence' to get comprehensive profiles of paper authors*"
+                )
+
+                with gr.Row():
+                    reset_preferences_btn = gr.Button(
+                        "🔄 Reset Preferences",
+                        size="sm"
+                    )
+
+            gr.Markdown("---")
+
+            # NEW: Field Intelligence Panel (collapsed by default)
+            with gr.Accordion("🔬 Field Intelligence", open=False, elem_classes="field-card"):
+                gr.Markdown("""
+                **Understand the research field context:**
+                - Current state of the art
+                - Recent breakthroughs and trends
+                - Key research directions
+                - Related subfields
+
+                *This feature is ready for Phase 2 implementation*
+                """)
+
+                fetch_field_btn = gr.Button(
+                    "🔍 Fetch Field Intelligence",
+                    variant="primary"
+                )
+
+                field_intelligence_output = gr.Markdown(
+                    "*Field intelligence will be available in Phase 2*"
+                )
 
             gr.Markdown("---")
 
@@ -381,8 +610,8 @@ with gr.Blocks(
     # Event handlers
     upload_btn.click(
         fn=upload_and_process_paper,
-        inputs=[pdf_upload],
-        outputs=[paper_info, citations_list, citation_dropdown]
+        inputs=[pdf_upload, session_state],
+        outputs=[paper_info, citations_list, citation_dropdown, session_state, pdf_viewer]
     )
 
     explain_btn.click(
@@ -397,12 +626,37 @@ with gr.Blocks(
         outputs=[answer_output]
     )
 
+    # NEW: Author Intelligence event handlers
+    fetch_author_btn.click(
+        fn=lambda detail, state: get_author_intelligence_for_paper(
+            state.get("current_paper_id", ""),
+            state.get("session_id", ""),
+            detail
+        ),
+        inputs=[author_detail_level, session_state],
+        outputs=[author_intelligence_output]
+    )
+
+    reset_preferences_btn.click(
+        fn=lambda state: reset_session_preferences(state.get("session_id", "")),
+        inputs=[session_state],
+        outputs=[author_intelligence_output]
+    )
+
+    # NEW: Field Intelligence event handler (placeholder)
+    fetch_field_btn.click(
+        fn=lambda state: get_field_intelligence_placeholder(state.get("current_paper_id", "")),
+        inputs=[session_state],
+        outputs=[field_intelligence_output]
+    )
+
     # Footer
     gr.Markdown("""
     ---
     <div style="text-align: center; color: #666;">
-        <p>🔬 Research Agent with Citation Intelligence | Built with ❤️ for Researchers</p>
-        <p>Powered by Gemini AI + Perplexity Search + ChromaDB</p>
+        <p>🔬 Research Agent with Citation Intelligence + Author Intelligence | Built with ❤️ for Researchers</p>
+        <p>Powered by Gemini 2.0 Flash + Perplexity AI + Semantic Scholar + ChromaDB</p>
+        <p><small>Session ID: Unique per browser session | Preferences are cached for optimal experience</small></p>
     </div>
     """)
 
