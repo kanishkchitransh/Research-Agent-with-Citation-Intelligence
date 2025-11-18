@@ -152,7 +152,7 @@ research-agent/
 
 | Component | Technology | Why |
 |-----------|-----------|-----|
-| **LLM** | Gemini 2.0 Flash | FREE tier, native function calling, fast |
+| **LLM** | Gemini 2.5 Flash | FREE tier, native function calling, fast |
 | **Search** | Perplexity API | Web search for authors & fields |
 | **Metrics** | Semantic Scholar | FREE publication metrics |
 | **Vector DB** | ChromaDB | Persistent, no server needed |
@@ -240,7 +240,7 @@ SEMANTIC_SCHOLAR_API_KEY=your_key_here
 
 ```python
 # Model settings
-MODEL_NAME=gemini-2.0-flash-exp
+MODEL_NAME=gemini-2.5-flash-lite
 MAX_TOKENS=8192
 TEMPERATURE=0.7
 
